@@ -22,6 +22,7 @@ Dependencies: only numpy (and optionally matplotlib for plots).
 """
 
 from __future__ import annotations
+from plot_utils import plot_dashboard
 
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
@@ -288,60 +289,20 @@ def optimize_trajectory_following(
         qi = _project_to_limits(arm, Q[i], joints)
         P[i] = _fk_end(arm, qi, joints)
 
+
+    dP = P[1:] - P[:-1]
+    speed = np.linalg.norm(dP, axis=1) / dt
     return {
         "Q_deg": Q,
         "P": P,
         "P_target": P_target,
+        "speed": speed,
         "loss_history": loss_hist,
         "joints": joints,
         "dt": dt,
         "v_des": v_des,
     }
 
-
-# -----------------------------
-# Optional plotting helper
-# -----------------------------
-
-def plot_result(result: Dict[str, object]) -> None:
-    """
-    Requires matplotlib. Plots:
-      - 3D path: achieved vs target
-      - loss curve
-      - speed over time
-    """
-    import matplotlib.pyplot as plt
-
-    P = np.asarray(result["P"])
-    T = np.asarray(result["P_target"])
-    dt = float(result["dt"])
-
-    # 3D path
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
-    ax.plot(T[:, 0], T[:, 1], T[:, 2])
-    ax.plot(P[:, 0], P[:, 1], P[:, 2])
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.legend(["target", "achieved"])
-
-    # loss curve
-    plt.figure()
-    plt.plot(result["loss_history"])
-    plt.xlabel("iter")
-    plt.ylabel("loss")
-
-    # speed curve
-    dP = P[1:] - P[:-1]
-    speed = np.linalg.norm(dP, axis=1) / dt
-    plt.figure()
-    plt.plot(speed)
-    plt.axhline(float(result["v_des"]), linestyle="--")
-    plt.xlabel("segment")
-    plt.ylabel("speed (units/s)")
-
-    plt.show()
 
 
 # -----------------------------
@@ -352,8 +313,8 @@ if __name__ == "__main__":
     arm = create_default_arm()
 
     # Example: start/end joint angles (degrees). Fill any subset; unspecified -> current arm values.
-    q_start = {1: 0.0, 2: 90.0, 3: 0.0, 4: 0.0, 5: 0.0}
-    q_end = {1: 0.0, 2: -90.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    q_start = {1: 0.0, 2: 70.0, 3: 0.0, 4: 0.0, 5: 0.0}
+    q_end = {1: 0.0, 2: -70.0, 3: 0.0, 4: 0.0, 5: 0.0}
 
     # Target Cartesian arc on the "floor" with an apex
     traj = make_floor_arc_trajectory(
@@ -379,4 +340,4 @@ if __name__ == "__main__":
     print("Final loss:", res["loss_history"][-1])
 
     #Uncomment if you have matplotlib:
-    plot_result(res)
+    plot_dashboard(res, title="Stable IK", show=True)
