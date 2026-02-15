@@ -6,7 +6,7 @@ python3 trajectory_optimize2.py
 
 python3 trajectory_optimize3.py  
 
-python3 trajectory_optimize4.py - solve with MK  
+python3 trajectory_optimize4.py - solve with LM  
 
 python3 trajectory_optimize5.py - solve with graph and A*  
 
