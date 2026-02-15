@@ -1,3 +1,5 @@
+6-DOF robot arm model and path solvers.  
+
 python3 trajectory_optimize.py - solve with local IK  
 
 python3 trajectory_optimize2.py  
