@@ -1,26 +1,23 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-trajectory_optimize_astar_playback.py
+trajectory_optimize6_aggressive.py
 
-Lazy A* planner in discretized JOINT space with Cartesian tube pruning.
+Aggressive A* / Weighted-A* planner in discretized JOINT space, optimizing TCP position.
 
-Idea:
-- State: 5 joint angles (degrees) discretized by STEP_DEG (default 4.0)
-- Neighbors: +/- STEP_DEG on one joint (10 neighbors for 5 joints)
-- Valid state: inside servo limits AND FK(state) is within DIST_THRESHOLD of the
-  Cartesian straight line segment between FK(q_start) and FK(q_end).
-- Cost: 1 per move (or weighted by joint delta)
-- Heuristic: joint-space Manhattan distance to q_end / STEP_DEG (admissible)
+Key properties:
+- State: joint angles (degrees) discretized by step_deg
+- Neighbors: +/- step_deg on one joint
+- Valid: joint limits only (NO hard tube pruning)
+- Edge cost: 1 per move + soft penalty for distance to the straight segment between FK(q_start) and FK(q_goal)
+- Goal: any state whose TCP is within goal_pos_eps of p_goal = FK(q_goal)
+- Heuristic: primarily Cartesian distance to p_goal converted to "steps" using an empirical dp_per_step scale,
+            optionally plus a small joint-space term, plus an optional progress tie-break.
+- Aggressive mode: Weighted A* (f = g + w_astar * h). Set w_astar > 1 for aggression.
+- Exports: optimal_path.jsonl and optimal_path.csv compatible with main_with_playback.py
+- Dashboard: works with plot_utils.plot_dashboard (expects P, P_target, speed)
 
-Output:
-- Writes optimal_path.jsonl and optimal_path.csv compatible with main_with_playback.py
-- Returns a result dict with P, P_target, speed so it works with plot_utils.plot_dashboard
-
-Notes:
-- This is a first baseline. With a very small threshold like 0.1, the pruned tube
-  will likely be disconnected at 4° resolution; if no path is found, increase threshold
-  or decrease STEP_DEG.
-
-Dependencies: numpy
+This file is meant to be dropped in and used in place of trajectory_optimize6.py.
 """
 
 from __future__ import annotations
@@ -69,19 +66,26 @@ def create_default_arm() -> fkmodel.Manipulator6DOF:
 # Geometry helpers
 # -----------------------------
 
-def point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
-    """Euclidean distance from point p to segment a-b."""
+def point_segment_distance_and_param(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> Tuple[float, float, np.ndarray]:
+    """
+    Returns:
+      - distance from p to segment a-b
+      - segment parameter t in [0,1]
+      - closest point proj = a + t*(b-a)
+    """
     p = np.asarray(p, dtype=float)
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     ab = b - a
     denom = float(np.dot(ab, ab))
     if denom < 1e-12:
-        return float(np.linalg.norm(p - a))
+        t = 0.0
+        proj = a
+        return float(np.linalg.norm(p - a)), t, proj
     t = float(np.dot(p - a, ab) / denom)
     t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
     proj = a + t * ab
-    return float(np.linalg.norm(p - proj))
+    return float(np.linalg.norm(p - proj)), t, proj
 
 
 def fk_end(arm: fkmodel.Manipulator6DOF, q_deg: np.ndarray, joints: Tuple[int, ...]) -> np.ndarray:
@@ -102,7 +106,7 @@ def snap_to_grid(q_deg: np.ndarray, step_deg: float) -> np.ndarray:
 
 
 def state_key(q_deg: np.ndarray) -> Tuple[int, ...]:
-    # store as integer "ticks" of 0.01 degree to avoid float key issues
+    # integer ticks of 0.01 degree (stable dict key)
     return tuple(int(round(float(x) * 100)) for x in q_deg)
 
 
@@ -182,17 +186,38 @@ def save_for_main_with_playback(
 
 @dataclass
 class AStarConfig:
-    joints: Tuple[int, ...] = (1, 2, 3, 4, 5)
-    step_deg: float = 4.0
-    dist_threshold: float = 10.0  # tube radius in same units as fkmodel (likely mm)
+    joints: Tuple[int, ...] = (1, 2, 3, 4)     # you disabled servo 5 (roll) because it doesn't change TCP position
+    step_deg: float = 1.0
 
+    # NOTE: dist_threshold is kept only for backward compatibility with labels;
+    # we do NOT prune by tube anymore (soft cost is used instead).
+    dist_threshold: float = 0.0
+
+    goal_pos_eps: float = 10.0
+
+    # Heuristic weights (h)
+    cart_h_scale: float = 1.0      # scale for Cartesian-to-goal (in "steps")
+    joint_h_scale: float = 0.0     # optional tiny pull toward q_goal (in steps); set 0 for pure Cartesian
+    progress_h_scale: float = 0.2  # tie-break: prefer higher progress t along the segment
+
+    # Edge cost penalty for deviating from the line segment
+    line_cost_weight: float = 0.001
+    line_soft_radius: float = 0.0
+
+
+    # Make large Cartesian arcs expensive (adds to g)
+    cart_step_cost_weight: float = 1.0   # weight for ||Δp|| expressed in 'steps'
+    # Aggressive mode: Weighted A*
+    w_astar: float = 25.0          # f = g + w_astar * h
+
+    # Output timing
     total_time: float = 3.0
     step_ms: int = 20
 
-    max_expansions: int = 2_000_000
+    # Search limits / debug
+    max_expansions: int = 500_000
     cache_fk: bool = True
-
-    progress_every: int = 25_000  # print every N expansions
+    progress_every: int = 25_000
 
 
 def astar_plan(
@@ -211,122 +236,163 @@ def astar_plan(
     q0 = snap_to_grid(q0, cfg.step_deg)
     qg = snap_to_grid(qg, cfg.step_deg)
 
-    # Cartesian line endpoints
-    p0 = fk_end(arm, q0, joints)
-    p1 = fk_end(arm, qg, joints)
-
-    # admissible heuristic: L1 distance in steps (each move changes one joint by step_deg)
-    def h(q: np.ndarray) -> float:
-        return float(np.sum(np.abs(q - qg)) / cfg.step_deg)
-
-    # validity test (limits + tube)
     fk_cache: Dict[Tuple[int, ...], np.ndarray] = {}
+
+    def fk_cached(q: np.ndarray) -> np.ndarray:
+        k = state_key(q)
+        p = fk_cache.get(k)
+        if p is None:
+            p = fk_end(arm, q, joints)
+            if cfg.cache_fk:
+                fk_cache[k] = p
+        return p
 
     def valid(q: np.ndarray) -> bool:
         for k, j in enumerate(joints):
             if q[k] < specs[j].min_deg - 1e-9 or q[k] > specs[j].max_deg + 1e-9:
                 return False
-        key = state_key(q)
-        if cfg.cache_fk and key in fk_cache:
-            p = fk_cache[key]
-        else:
-            p = fk_end(arm, q, joints)
-            if cfg.cache_fk:
-                fk_cache[key] = p
-        return point_segment_distance(p, p0, p1) <= cfg.dist_threshold + 1e-12
+        return True
 
-    # early reject
     if not valid(q0):
-        raise RuntimeError("Start state is outside the tube (increase threshold or adjust start).")
+        raise RuntimeError("Start state violates joint limits.")
     if not valid(qg):
-        raise RuntimeError("Goal state is outside the tube (increase threshold or adjust goal).")
+        raise RuntimeError("Goal state violates joint limits.")
 
+    # Cartesian endpoints
+    p0 = fk_cached(q0)
+    p1 = fk_cached(qg)
+
+    # Empirical "how much TCP can move in one step_deg" scale to make h comparable to g(steps)
+    def estimate_dp_per_step(q_ref: np.ndarray) -> float:
+        p_ref = fk_cached(q_ref)
+        best = 0.0
+        for d in range(D):
+            dq = np.zeros(D, dtype=float)
+            dq[d] = cfg.step_deg
+            p_plus = fk_cached(snap_to_grid(q_ref + dq, cfg.step_deg))
+            p_minus = fk_cached(snap_to_grid(q_ref - dq, cfg.step_deg))
+            best = max(best, float(np.linalg.norm(p_plus - p_ref)), float(np.linalg.norm(p_minus - p_ref)))
+        return best
+
+    dp0 = estimate_dp_per_step(q0)
+    dpg = estimate_dp_per_step(qg)
+    dp_per_step = max(1e-6, dp0, dpg)
+    print(f"[A*] dp_per_step≈{dp_per_step:.3f} (Cartesian units per one ±step_deg move)")
+
+    # Heuristic: steps-to-goal (Cartesian) + optional joint pull + progress tie-break
+    def h(q: np.ndarray) -> float:
+        p = fk_cached(q)
+        dist_goal = float(np.linalg.norm(p1 - p))
+        hc_steps = dist_goal / dp_per_step
+
+        hj_steps = float(np.sum(np.abs(q - qg)) / cfg.step_deg)
+
+        d_line, t, _ = point_segment_distance_and_param(p, p0, p1)
+        hp = (1.0 - t)  # closer to 0 when progressed to the end
+
+        return cfg.cart_h_scale * hc_steps + cfg.joint_h_scale * hj_steps + cfg.progress_h_scale * hp
+
+    # Data structures
     start_key = state_key(q0)
-    goal_key = state_key(qg)
+    key_to_q: Dict[Tuple[int, ...], np.ndarray] = {start_key: q0}
 
     open_heap: List[Tuple[float, float, Tuple[int, ...]]] = []
-    heapq.heappush(open_heap, (h(q0), 0.0, start_key))
-
-    came_from: Dict[Tuple[int, ...], Tuple[int, ...]] = {}
     g_score: Dict[Tuple[int, ...], float] = {start_key: 0.0}
+    came_from: Dict[Tuple[int, ...], Tuple[int, ...]] = {}
 
-    # store actual q arrays for keys we touch
-    key_to_q: Dict[Tuple[int, ...], np.ndarray] = {start_key: q0}
+    best_goal_key = start_key
+    best_goal_dist = float(np.linalg.norm(p1 - p0))
+
+    # Weighted-A* priority
+    heapq.heappush(open_heap, (cfg.w_astar * h(q0), 0.0, start_key))
 
     expansions = 0
     t_start = time.time()
 
     while open_heap:
         fcur, gcur, kcur = heapq.heappop(open_heap)
+        qcur = key_to_q[kcur]
+        pcur = fk_cached(qcur)
 
-        if kcur == goal_key:
+        dist_goal = float(np.linalg.norm(p1 - pcur))
+        if dist_goal < best_goal_dist:
+            best_goal_dist = dist_goal
+            best_goal_key = kcur
+
+        if dist_goal <= cfg.goal_pos_eps:
+            best_goal_key = kcur
+            best_goal_dist = dist_goal
             break
 
         expansions += 1
-        if expansions > cfg.max_expansions:
-            raise RuntimeError(f"A* exceeded max_expansions={cfg.max_expansions}. Try larger threshold or smaller step_deg.")
+        if expansions >= cfg.max_expansions:
+            print(f"[A*] max_expansions reached; using best_goal_dist={best_goal_dist:.3f}")
+            break
 
-        if cfg.progress_every and (expansions % cfg.progress_every == 0):
-            # Rough progress info (A* has no true progress percentage)
+        if cfg.progress_every and expansions % cfg.progress_every == 0:
             elapsed = time.time() - t_start
             rate = expansions / elapsed if elapsed > 1e-9 else float('inf')
-            open_size = len(open_heap)
             best_f = open_heap[0][0] if open_heap else float('nan')
-            rem = h(qcur)  # joint-space lower bound (steps)
+            open_size = len(open_heap)
+            rem = h(qcur)
             print(f"[A*] expanded={expansions:,} open={open_size:,} touched={len(key_to_q):,} "
-                  f"fk_cache={len(fk_cache):,} best_f={best_f:.2f} rem_steps~{rem:.1f} "
+                  f"fk_cache={len(fk_cache):,} best_f={best_f:.2f} h~{rem:.2f} best_goal_dist={best_goal_dist:.2f} "
                   f"rate={rate:,.0f}/s elapsed={elapsed:,.1f}s")
 
-        qcur = key_to_q[kcur]
-
-        # neighbors: +/- step on one joint
+        # Expand neighbors
+        base_g = g_score[kcur]
         for d in range(D):
             for sgn in (-1.0, +1.0):
                 qn = qcur.copy()
                 qn[d] += sgn * cfg.step_deg
                 qn = snap_to_grid(qn, cfg.step_deg)
-                kn = state_key(qn)
-
-                if kn not in key_to_q:
-                    key_to_q[kn] = qn
-
                 if not valid(qn):
                     continue
 
-                tentative = g_score[kcur] + 1.0  # uniform cost per move
+                kn = state_key(qn)
+                if kn not in key_to_q:
+                    key_to_q[kn] = qn
+
+                pn = fk_cached(qn)
+                d_line, _, _ = point_segment_distance_and_param(pn, p0, p1)
+                excess = max(0.0, d_line - cfg.line_soft_radius)
+
+                dp = float(np.linalg.norm(pn - pcur))
+                dp_steps = dp / dp_per_step
+                tentative_g = base_g + 1.0 + cfg.line_cost_weight * (excess * excess) + cfg.cart_step_cost_weight * dp_steps
                 old = g_score.get(kn)
-                if old is None or tentative < old:
+                if old is None or tentative_g < old:
                     came_from[kn] = kcur
-                    g_score[kn] = tentative
-                    heapq.heappush(open_heap, (tentative + h(qn), tentative, kn))
+                    g_score[kn] = tentative_g
+                    f = tentative_g + cfg.w_astar * h(qn)  # aggressive / weighted A*
+                    heapq.heappush(open_heap, (f, tentative_g, kn))
 
-    if goal_key not in g_score:
-        raise RuntimeError("No path found within the tube. Increase dist_threshold or reduce step_deg.")
-
-    # reconstruct path in joint space
-    path_keys = [goal_key]
+    # Reconstruct path from best_goal_key back to start_key
+    path_keys = [best_goal_key]
     while path_keys[-1] != start_key:
-        path_keys.append(came_from[path_keys[-1]])
+        cur = path_keys[-1]
+        parent = came_from.get(cur)
+        if parent is None:
+            print(f"[A*] Warning: broken parent chain at {cur}; returning partial path.")
+            break
+        path_keys.append(parent)
     path_keys.reverse()
 
     Q = np.array([key_to_q[k] for k in path_keys], dtype=float)
 
-    # Cartesian path
+    # Cartesian path for dashboard
     P = np.zeros((len(Q), 3), dtype=float)
     for i in range(len(Q)):
-        key = state_key(Q[i])
-        if cfg.cache_fk and key in fk_cache:
-            P[i] = fk_cache[key]
-        else:
-            P[i] = fk_end(arm, Q[i], joints)
+        P[i] = fk_cached(Q[i])
 
-    # Target points for plotting: sample along line with same number of points
-    T = np.linspace(0.0, 1.0, len(Q))
-    P_target = (1 - T)[:, None] * p0[None, :] + T[:, None] * p1[None, :]
+    # Target points: closest point on the line segment for each achieved point
+    P_target = np.zeros_like(P)
+    for i in range(len(P)):
+        _, tseg, proj = point_segment_distance_and_param(P[i], p0, p1)
+        P_target[i] = proj
 
     dt = cfg.total_time / max(1, (len(Q) - 1))
-    dP = P[1:] - P[:-1]
-    speed = np.linalg.norm(dP, axis=1) / dt
+    speed = np.linalg.norm(P[1:] - P[:-1], axis=1) / dt if len(P) > 1 else np.array([], dtype=float)
 
     return {
         "Q_deg": Q,
@@ -339,7 +405,12 @@ def astar_plan(
         "states_touched": len(key_to_q),
         "fk_cached": len(fk_cache),
         "tube_threshold": cfg.dist_threshold,
+        "goal_pos_eps": cfg.goal_pos_eps,
+        "best_goal_dist": best_goal_dist,
+        "goal_reached": best_goal_dist <= cfg.goal_pos_eps + 1e-12,
         "step_deg": cfg.step_deg,
+        "w_astar": cfg.w_astar,
+        "dp_per_step": dp_per_step,
     }
 
 
@@ -350,17 +421,27 @@ def astar_plan(
 if __name__ == "__main__":
     arm = create_default_arm()
 
-    # Example
+    # Example (servo 5 ignored by joints=(1,2,3,4))
     q_start = {1: 0.0, 2: 70.0, 3: 0.0, 4: 0.0, 5: 0.0}
     q_end   = {1: 0.0, 2: -70.0, 3: 0.0, 4: 0.0, 5: 0.0}
 
     cfg = AStarConfig(
         joints=(1, 2, 3, 4),
         step_deg=1.0,
-        dist_threshold=80.0,   # sensible starting tube radius; adjust as needed
+        goal_pos_eps=10.0,
+        # Heuristic: pure Cartesian (joint_h_scale=0). Make cart dominant.
+        cart_h_scale=1.0,
+        joint_h_scale=0.0,
+        progress_h_scale=0.2,
+        # Soft-line cost: keep small so it doesn't block reaching the goal
+        line_cost_weight=0.0002,
+        line_soft_radius=0.0,
+        cart_step_cost_weight=1.0,
+        # Aggressive Weighted A*
+        w_astar=20.0,
         total_time=3.0,
         step_ms=20,
-        max_expansions=2_000_000,
+        max_expansions=300_000,
         cache_fk=True,
     )
 
@@ -369,9 +450,10 @@ if __name__ == "__main__":
     print("A* expansions:", res["expansions"])
     print("States touched:", res["states_touched"])
     print("FK cached:", res["fk_cached"])
+    print("best_goal_dist:", float(res["best_goal_dist"]))
     print("Mean tracking error:", float(np.mean(np.linalg.norm(res["P"] - res["P_target"], axis=1))))
     print("Max tracking error:", float(np.max(np.linalg.norm(res["P"] - res["P_target"], axis=1))))
-    print("Speed std:", float(np.std(res["speed"])))
+    print("Speed std:", float(np.std(res["speed"])) if len(res["speed"]) else float("nan"))
 
     jsonl_path, csv_path = save_for_main_with_playback(
         arm=arm,
@@ -383,9 +465,8 @@ if __name__ == "__main__":
     )
     print("Saved for playback:", jsonl_path, csv_path)
 
-    # Optional plotting (shared utility)
     try:
         from plot_utils import plot_dashboard
-        plot_dashboard(res, title=f"A* (step={cfg.step_deg}°, tube={cfg.dist_threshold})")
+        plot_dashboard(res, title=f"Weighted A* (step={cfg.step_deg}°, W={cfg.w_astar})")
     except Exception as e:
         print("Plot skipped:", e)
